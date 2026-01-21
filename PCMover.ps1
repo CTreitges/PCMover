@@ -253,32 +253,71 @@ function Export-Program {
     $regExportDir = Join-Path $exportDir "Registry"
     New-Item -ItemType Directory -Path $regExportDir -Force | Out-Null
     
-    $regPaths = @("HKCU:\SOFTWARE", "HKLM:\SOFTWARE")
+    # Suche Registry-Keys direkt ohne tiefe Rekursion (verhindert Crashes)
+    $regSearchPaths = @(
+        "HKCU:\SOFTWARE\$searchPattern",
+        "HKCU:\SOFTWARE\*$searchPattern*",
+        "HKLM:\SOFTWARE\$searchPattern",
+        "HKLM:\SOFTWARE\*$searchPattern*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*$searchPattern*",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*$searchPattern*",
+        "HKLM:\SOFTWARE\WOW6432Node\*$searchPattern*"
+    )
     
-    foreach ($regPath in $regPaths) {
-        $hive = if ($regPath -like "HKCU:*") { "HKCU" } else { "HKLM" }
+    $exportedKeys = @{}  # Verhindert doppelte Exports
+    
+    foreach ($searchPath in $regSearchPaths) {
+        $hive = if ($searchPath -like "HKCU:*") { "HKCU" } else { "HKLM" }
         
         try {
-            $matchingKeys = Get-ChildItem -Path $regPath -Recurse -ErrorAction SilentlyContinue | 
-                Where-Object { $_.PSPath -like "*$searchPattern*" } | 
-                Select-Object -First 10
+            $matchingKeys = @()
+            try {
+                $matchingKeys = Get-Item -Path $searchPath -ErrorAction SilentlyContinue 2>$null
+            } catch { }
+            
+            if (-not $matchingKeys) { continue }
             
             foreach ($key in $matchingKeys) {
-                $keyName = $key.PSPath -replace ".*::", ""
-                $safeKeyName = ($keyName -replace '[\\/:*?"<>|]', '_') + ".reg"
-                $regFile = Join-Path $regExportDir "$hive`_$safeKeyName"
-                
-                $fullKeyPath = $key.PSPath -replace "Microsoft.PowerShell.Core\\Registry::", ""
+                if (-not $key -or -not $key.PSPath) { continue }
                 
                 try {
-                    reg export $fullKeyPath $regFile /y 2>&1 | Out-Null
-                    $manifest.Components += @{Type="Registry"; Key=$fullKeyPath; File=$regFile}
-                    Add-Content $logFile "Registry exportiert: $fullKeyPath" -Encoding UTF8
+                    $keyName = $key.PSPath -replace ".*::", ""
+                    if (-not $keyName) { continue }
+                    
+                    # Verhindere doppelte Exports
+                    if ($exportedKeys.ContainsKey($keyName)) { continue }
+                    $exportedKeys[$keyName] = $true
+                    
+                    $safeKeyName = ($keyName -replace '[\\/:*?"<>|]', '_')
+                    if ($safeKeyName.Length -gt 100) {
+                        $safeKeyName = $safeKeyName.Substring(0, 100)
+                    }
+                    $safeKeyName += ".reg"
+                    $regFile = Join-Path $regExportDir "$hive`_$safeKeyName"
+                    
+                    $fullKeyPath = $key.PSPath -replace "Microsoft.PowerShell.Core\\Registry::", ""
+                    if (-not $fullKeyPath) { continue }
+                    
+                    # reg export mit robuster Fehlerbehandlung
+                    $regResult = $null
+                    try {
+                        $regResult = & reg export "$fullKeyPath" "$regFile" /y 2>&1
+                        if (Test-Path $regFile) {
+                            $manifest.Components += @{Type="Registry"; Key=$fullKeyPath; File=$regFile}
+                            try { Add-Content $logFile "Registry exportiert: $fullKeyPath" -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
+                        }
+                    } catch {
+                        try { Add-Content $logFile "Registry Fehler: $fullKeyPath - $_" -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
+                    }
                 } catch {
-                    Add-Content $logFile "Registry Fehler: $fullKeyPath - $_" -Encoding UTF8
+                    # Einzelnen Key-Fehler ignorieren, weitermachen
+                    continue
                 }
             }
-        } catch { }
+        } catch {
+            # Pfad-Fehler ignorieren, weitermachen
+            continue
+        }
     }
     
     $completedTasks++
@@ -780,9 +819,9 @@ function Load-Programs {
     
     foreach ($prog in $programs) {
         $item = New-Object System.Windows.Forms.ListViewItem($prog.DisplayName)
-        $item.SubItems.Add($prog.DisplayVersion) | Out-Null
-        $item.SubItems.Add($prog.Publisher) | Out-Null
-        $item.SubItems.Add($prog.InstallLocation) | Out-Null
+        $item.SubItems.Add([string]$(if ($prog.DisplayVersion) { $prog.DisplayVersion } else { "" })) | Out-Null
+        $item.SubItems.Add([string]$(if ($prog.Publisher) { $prog.Publisher } else { "" })) | Out-Null
+        $item.SubItems.Add([string]$(if ($prog.InstallLocation) { $prog.InstallLocation } else { "" })) | Out-Null
         $item.Tag = $prog
         $listPrograms.Items.Add($item) | Out-Null
     }
