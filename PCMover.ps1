@@ -90,6 +90,9 @@ function Export-Program {
         ExportDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         InstallLocation = $InstallLocation
         Components = @()
+        PathEntries = @()
+        Services = @()
+        ScheduledTasks = @()
     }
     
     Add-Content $logFile "=== PCMover Export Log ===" -Encoding UTF8
@@ -143,7 +146,56 @@ function Export-Program {
         }
     }
     
-    $totalTasks = $exportTasks.Count + 1  # +1 fuer Registry
+    # 4. Start-Menü Verknuepfungen
+    $shortcutExportDir = Join-Path $exportDir "Shortcuts"
+    New-Item -ItemType Directory -Path (Join-Path $shortcutExportDir "StartMenu") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $shortcutExportDir "Desktop") -Force | Out-Null
+
+    $shell = New-Object -ComObject WScript.Shell
+    $startMenuPaths = @(
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+        "C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+    )
+    foreach ($smPath in $startMenuPaths) {
+        Get-ChildItem -Path $smPath -Recurse -Filter "*.lnk" -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $lnk = $shell.CreateShortcut($_.FullName)
+                $matchByName = $_.BaseName -like "*$searchPattern*"
+                $matchByTarget = $InstallLocation -and $lnk.TargetPath -like "*$InstallLocation*"
+                if ($matchByName -or $matchByTarget) {
+                    $destFile = Join-Path $shortcutExportDir "StartMenu\$($_.Name)"
+                    Copy-Item $_.FullName $destFile -Force -ErrorAction SilentlyContinue
+                    if (Test-Path $destFile) {
+                        $manifest.Components += @{Type="StartMenu"; Source=$_.FullName; File=$destFile}
+                        Add-Content $logFile "Verknuepfung exportiert: $($_.FullName)" -Encoding UTF8
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    # 5. Desktop-Verknuepfungen
+    $desktopPaths = @("$env:USERPROFILE\Desktop", "C:\Users\Public\Desktop")
+    foreach ($dPath in $desktopPaths) {
+        Get-ChildItem -Path $dPath -Filter "*.lnk" -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $lnk = $shell.CreateShortcut($_.FullName)
+                $matchByName = $_.BaseName -like "*$searchPattern*"
+                $matchByTarget = $InstallLocation -and $lnk.TargetPath -like "*$InstallLocation*"
+                if ($matchByName -or $matchByTarget) {
+                    $destFile = Join-Path $shortcutExportDir "Desktop\$($_.Name)"
+                    Copy-Item $_.FullName $destFile -Force -ErrorAction SilentlyContinue
+                    if (Test-Path $destFile) {
+                        $manifest.Components += @{Type="Desktop"; Source=$_.FullName; File=$destFile}
+                        Add-Content $logFile "Desktop-Verknuepfung exportiert: $($_.FullName)" -Encoding UTF8
+                    }
+                }
+            } catch {}
+        }
+    }
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($shell) | Out-Null
+
+    $totalTasks = $exportTasks.Count + 3  # +1 Verknuepfungen, +1 Registry, +1 Tasks/Dienste/PATH
     $completedTasks = 0
     
     if ($ProgressBar) {
@@ -253,6 +305,11 @@ function Export-Program {
     $regExportDir = Join-Path $exportDir "Registry"
     New-Item -ItemType Directory -Path $regExportDir -Force | Out-Null
     
+    # HKCR PSDrive erstellen fuer Datei-Assoziationen
+    if (-not (Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
+        New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -ErrorAction SilentlyContinue | Out-Null
+    }
+
     # Suche Registry-Keys direkt ohne tiefe Rekursion (verhindert Crashes)
     $regSearchPaths = @(
         "HKCU:\SOFTWARE\$searchPattern",
@@ -261,13 +318,22 @@ function Export-Program {
         "HKLM:\SOFTWARE\*$searchPattern*",
         "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*$searchPattern*",
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*$searchPattern*",
-        "HKLM:\SOFTWARE\WOW6432Node\*$searchPattern*"
+        "HKLM:\SOFTWARE\WOW6432Node\*$searchPattern*",
+        "HKCR:\Applications\*$searchPattern*"
     )
+
+    # HKCR: Datei-Assoziationen ueber Programm-Executables finden
+    if ($InstallLocation -and (Test-Path $InstallLocation)) {
+        $exeFiles = Get-ChildItem -Path $InstallLocation -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 5
+        foreach ($exe in $exeFiles) {
+            $regSearchPaths += "HKCR:\Applications\$($exe.Name)"
+        }
+    }
     
     $exportedKeys = @{}  # Verhindert doppelte Exports
     
     foreach ($searchPath in $regSearchPaths) {
-        $hive = if ($searchPath -like "HKCU:*") { "HKCU" } else { "HKLM" }
+        $hive = if ($searchPath -like "HKCU:*") { "HKCU" } elseif ($searchPath -like "HKCR:*") { "HKCR" } else { "HKLM" }
         
         try {
             $matchingKeys = @()
@@ -321,10 +387,79 @@ function Export-Program {
     }
     
     $completedTasks++
+    if ($ProgressBar -and $Form) {
+        $percent = [int](($completedTasks / $totalTasks) * 100)
+        $ProgressBar.Value = [Math]::Min($percent, 100)
+        if ($StatusLabel) { $StatusLabel.Text = "Exportiere $ProgramName... PATH/Dienste/Tasks" }
+        $Form.Refresh()
+    }
+
+    # 7. PATH-Eintraege sichern
+    $pathEntriesToMigrate = @()
+    $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    foreach ($pathStr in @($userPath, $machinePath)) {
+        if ($pathStr) {
+            $pathStr -split ';' | Where-Object {
+                $_ -and ($_ -like "*$searchPattern*" -or ($InstallLocation -and $_ -like "*$InstallLocation*"))
+            } | ForEach-Object {
+                if ($_ -notin $pathEntriesToMigrate) {
+                    $pathEntriesToMigrate += $_
+                }
+            }
+        }
+    }
+    $manifest.PathEntries = $pathEntriesToMigrate
+    if ($pathEntriesToMigrate.Count -gt 0) {
+        Add-Content $logFile "PATH-Eintraege: $($pathEntriesToMigrate -join '; ')" -Encoding UTF8
+    }
+
+    # 8. Windows-Dienste erkennen
+    $relatedServices = @()
+    try {
+        Get-WmiObject Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+            $_.PathName -and ($_.PathName -like "*$searchPattern*" -or ($InstallLocation -and $_.PathName -like "*$InstallLocation*"))
+        } | ForEach-Object {
+            $relatedServices += @{Name=$_.Name; DisplayName=$_.DisplayName; StartMode=$_.StartMode}
+            Add-Content $logFile "Dienst erkannt: $($_.Name) ($($_.StartMode))" -Encoding UTF8
+        }
+    } catch {}
+    $manifest.Services = $relatedServices
+
+    # 9. Geplante Tasks exportieren
+    $taskExportDir = Join-Path $exportDir "ScheduledTasks"
+    New-Item -ItemType Directory -Path $taskExportDir -Force | Out-Null
+    $scheduledTasks = @()
+    try {
+        Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+            $matchTask = $false
+            if ($_.TaskName -like "*$searchPattern*" -or $_.TaskPath -like "*$searchPattern*") { $matchTask = $true }
+            if (-not $matchTask -and $InstallLocation) {
+                foreach ($action in $_.Actions) {
+                    if ($action.Execute -like "*$InstallLocation*" -or $action.Execute -like "*$searchPattern*") {
+                        $matchTask = $true
+                        break
+                    }
+                }
+            }
+            $matchTask
+        } | ForEach-Object {
+            $safeName = ($_.TaskName -replace '[\\/:*?"<>|]', '_')
+            $xmlFile = Join-Path $taskExportDir "$safeName.xml"
+            try {
+                Export-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath | Out-File $xmlFile -Encoding UTF8
+                $scheduledTasks += @{Name=$_.TaskName; TaskPath=$_.TaskPath; XmlFile=$xmlFile}
+                Add-Content $logFile "Task exportiert: $($_.TaskName)" -Encoding UTF8
+            } catch {}
+        }
+    } catch {}
+    $manifest.ScheduledTasks = $scheduledTasks
+
+    $completedTasks++
     if ($ProgressBar) {
         $ProgressBar.Value = 100
     }
-    
+
     # Manifest speichern
     $manifest | ConvertTo-Json -Depth 10 | Out-File $manifestFile -Encoding UTF8
     
@@ -366,9 +501,10 @@ function Import-Program {
         $ProgressBar.Value = 0
     }
     
-    # Trenne Datei-Komponenten und Registry-Komponenten
-    $fileComponents = $manifest.Components | Where-Object { $_.Type -ne "Registry" }
+    # Trenne Datei-Komponenten, Registry, und Verknuepfungen
+    $fileComponents = $manifest.Components | Where-Object { $_.Type -notin @("Registry", "StartMenu", "Desktop") }
     $registryComponents = $manifest.Components | Where-Object { $_.Type -eq "Registry" }
+    $shortcutComponents = $manifest.Components | Where-Object { $_.Type -in @("StartMenu", "Desktop") }
     
     # Parallele Verarbeitung fuer Datei-Komponenten
     $runspacePool = [runspacefactory]::CreateRunspacePool(1, $script:MaxParallelJobs)
@@ -487,13 +623,89 @@ function Import-Program {
         }
     }
     
+    # Verknuepfungen importieren
+    foreach ($component in $shortcutComponents) {
+        $currentComponent++
+        if (Test-Path $component.File) {
+            try {
+                $destPath = $component.Source
+                $destDir = Split-Path $destPath -Parent
+                if (-not (Test-Path $destDir)) {
+                    New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+                }
+                Copy-Item $component.File $destPath -Force -ErrorAction SilentlyContinue
+                Add-Content $logFile "Verknuepfung wiederhergestellt: $destPath" -Encoding UTF8
+            } catch {
+                Add-Content $logFile "Verknuepfung Fehler: $destPath - $_" -Encoding UTF8
+            }
+        }
+        if ($ProgressBar -and $totalComponents -gt 0) {
+            $percent = [int](($currentComponent / $totalComponents) * 100)
+            $ProgressBar.Value = [Math]::Min($percent, 100)
+        }
+    }
+
+    # PATH-Eintraege wiederherstellen
+    if ($manifest.PathEntries -and $manifest.PathEntries.Count -gt 0) {
+        if ($StatusLabel) { $StatusLabel.Text = "Importiere PATH-Eintraege..." }
+        if ($Form) { $Form.Refresh() }
+
+        $currentUserPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+        $newEntries = @()
+        foreach ($entry in $manifest.PathEntries) {
+            if ($currentUserPath -notlike "*$entry*") {
+                $newEntries += $entry
+            }
+        }
+        if ($newEntries.Count -gt 0) {
+            $updated = ($currentUserPath.TrimEnd(';') + ';' + ($newEntries -join ';')).TrimStart(';')
+            [System.Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+            Add-Content $logFile "PATH aktualisiert: $($newEntries -join '; ')" -Encoding UTF8
+        }
+    }
+
+    # Windows-Dienste starten
+    if ($manifest.Services -and $manifest.Services.Count -gt 0) {
+        if ($StatusLabel) { $StatusLabel.Text = "Starte Windows-Dienste..." }
+        if ($Form) { $Form.Refresh() }
+
+        foreach ($svc in $manifest.Services) {
+            try {
+                $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+                if ($service -and $service.Status -ne 'Running' -and $svc.StartMode -eq 'Auto') {
+                    Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
+                    Add-Content $logFile "Dienst gestartet: $($svc.Name)" -Encoding UTF8
+                }
+            } catch {
+                Add-Content $logFile "Dienst Fehler: $($svc.Name) - $_" -Encoding UTF8
+            }
+        }
+    }
+
+    # Geplante Tasks importieren
+    if ($manifest.ScheduledTasks -and $manifest.ScheduledTasks.Count -gt 0) {
+        if ($StatusLabel) { $StatusLabel.Text = "Importiere geplante Tasks..." }
+        if ($Form) { $Form.Refresh() }
+
+        foreach ($task in $manifest.ScheduledTasks) {
+            if (Test-Path $task.XmlFile) {
+                try {
+                    & schtasks /create /xml "$($task.XmlFile)" /tn "$($task.Name)" /f 2>&1 | Out-Null
+                    Add-Content $logFile "Task registriert: $($task.Name)" -Encoding UTF8
+                } catch {
+                    Add-Content $logFile "Task Fehler: $($task.Name) - $_" -Encoding UTF8
+                }
+            }
+        }
+    }
+
     if ($ProgressBar) {
         $ProgressBar.Value = 100
     }
-    
+
     Add-Content $logFile "" -Encoding UTF8
     Add-Content $logFile "=== Import abgeschlossen ===" -Encoding UTF8
-    
+
     return "Import erfolgreich abgeschlossen. Siehe Log: $logFile"
 }
 
@@ -606,6 +818,13 @@ $chkDocuments.Size = New-Object System.Drawing.Size(120, 25)
 $chkDocuments.Text = "Dokumente"
 $chkDocuments.Checked = $true
 $grpOptions.Controls.Add($chkDocuments)
+
+$chkShortcuts = New-Object System.Windows.Forms.CheckBox
+$chkShortcuts.Location = New-Object System.Drawing.Point(505, 25)
+$chkShortcuts.Size = New-Object System.Drawing.Size(130, 25)
+$chkShortcuts.Text = "Verknuepfungen"
+$chkShortcuts.Checked = $true
+$grpOptions.Controls.Add($chkShortcuts)
 
 $tabExport.Controls.Add($grpOptions)
 
@@ -971,9 +1190,19 @@ $listExports.Add_SelectedIndexChanged({
                 $details += "Export-Datum: $($manifest.ExportDate)`r`n"
                 $details += "Original-Pfad: $($manifest.InstallLocation)`r`n"
                 $details += "Komponenten: $($manifest.Components.Count)`r`n"
-                
+
                 foreach ($comp in $manifest.Components) {
                     $details += "  - $($comp.Type)`r`n"
+                }
+
+                if ($manifest.PathEntries -and $manifest.PathEntries.Count -gt 0) {
+                    $details += "PATH-Eintraege: $($manifest.PathEntries.Count)`r`n"
+                }
+                if ($manifest.Services -and $manifest.Services.Count -gt 0) {
+                    $details += "Windows-Dienste: $($manifest.Services.Count)`r`n"
+                }
+                if ($manifest.ScheduledTasks -and $manifest.ScheduledTasks.Count -gt 0) {
+                    $details += "Geplante Tasks: $($manifest.ScheduledTasks.Count)`r`n"
                 }
                 
                 $txtDetails.Text = $details
