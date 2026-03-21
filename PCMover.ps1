@@ -3,7 +3,7 @@
 # Mit Fortschrittsanzeige und Multithreading
 # UTF-8 Encoding fuer deutsche Umlaute
 
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 Add-Type -AssemblyName System.Windows.Forms
