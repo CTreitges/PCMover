@@ -15,8 +15,13 @@ Ein Windows-Tool zum Exportieren und Importieren von Programmen inklusive ihrer 
 
 - **Programmdateien**: Der Installationsordner des Programms
 - **AppData**: Einstellungen aus Roaming, Local und LocalLow
-- **Registry**: Programmspezifische Registry-Eintraege (HKCU und HKLM)
+- **Registry**: Programmspezifische Registry-Eintraege (HKCU, HKLM und HKCR)
 - **Dokumente**: Programmbezogene Ordner im Dokumente-Verzeichnis
+- **Verknuepfungen**: Start-Menü und Desktop-Verknuepfungen
+- **Datei-Assoziationen**: HKCR-Registry fuer Dateityp-Zuordnungen
+- **PATH-Eintraege**: Programmbezogene Eintraege in der PATH-Umgebungsvariable
+- **Windows-Dienste**: Erkennung und automatischer Start nach Import
+- **Geplante Tasks**: Scheduled Tasks des Programms
 
 ## Verwendung
 
@@ -57,7 +62,11 @@ PCMover_Exports/
     ├── ProgramFiles/          # Programmdateien
     ├── AppData_Roaming/       # Roaming-Einstellungen
     ├── AppData_Local/         # Lokale Einstellungen
-    ├── Registry/              # Registry-Eintraege (.reg)
+    ├── Registry/              # Registry-Eintraege (.reg) inkl. HKCR
+    ├── Shortcuts/             # Start-Menü und Desktop-Verknuepfungen
+    │   ├── StartMenu/
+    │   └── Desktop/
+    ├── ScheduledTasks/        # Geplante Tasks (XML)
     └── Documents/             # Dokumenten-Ordner
 ```
 
@@ -76,3 +85,6 @@ PCMover_Exports/
 - `robocopy` - Zum Kopieren von Dateien und Ordnern
 - `reg export/import` - Zum Exportieren/Importieren von Registry-Eintraegen
 - `Get-ItemProperty` - Zum Auflisten installierter Programme
+- `schtasks` - Zum Exportieren/Importieren von geplanten Tasks
+- `Get-ScheduledTask` / `Export-ScheduledTask` - Task-Erkennung und XML-Export
+- `Get-WmiObject Win32_Service` - Windows-Dienste erkennen
